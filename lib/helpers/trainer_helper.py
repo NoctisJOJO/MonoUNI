@@ -57,6 +57,12 @@ class Trainer(object):
         self.args = args
         # print(local_rank)
 
+        # self.device = torch.device(f"cuda:{self.local_rank}")
+        # # 如果使用分布式训练，确保模型被正确包装
+        # self.model = torch.nn.parallel.DistributedDataParallel(
+        #     self.model, device_ids=[self.local_rank]
+        # )
+
         # 如果配置文件中定义了“resume_model”字段，表示需要从指定模型恢复训练
         if self.cfg_train.get("resume_model", None):
             assert os.path.exists(self.cfg_train["resume_model"])
@@ -99,11 +105,15 @@ class Trainer(object):
             # reset numpy seed.
             # ref: https://github.com/pytorch/pytorch/issues/5059
             np.random.seed(np.random.get_state()[1][0] + epoch)
+            ####  主要是这里的问题，ei_loss 转为item()就没了梯度，不转item()内存就会持续增大
+            ######  再研究报错，发现是 ei_loss 变为了 float ，无法进行 unsqueeze()
             loss_weights = loss_weightor.compute_weight(ei_loss, self.epoch)
             log_str = "Weights: "
             for key in sorted(loss_weights.keys()):
                 log_str += " %s:%.4f," % (key[:-4], loss_weights[key])
             self.logger.info(log_str)
+            #### 第一个epoch的 ei_loss 在82行得到，未转换。第二个epoch 在这里得到，被转换了，所以报错
+            ##### 将 loss_term.detch().cpu().item() 改为 loss_term.detach().cpu() 后该报错消失
             ei_loss = self.train_one_epoch(loss_weights)
             self.epoch += 1
 
@@ -134,6 +144,8 @@ class Trainer(object):
                 self.logger.info("------ EVAL EPOCH %03d ------" % (self.epoch))
                 self.eval_one_epoch()
 
+            # 在每个 epoch 结束后清理缓存
+            torch.cuda.empty_cache()
         return None
 
     def compute_e0_loss(self):
@@ -143,6 +155,7 @@ class Trainer(object):
             total=len(self.train_loader), leave=True, desc="pre-training loss stat"
         )
         with torch.no_grad():
+            # i = 0
             for batch_idx, (
                 inputs,
                 calibs,
@@ -152,6 +165,9 @@ class Trainer(object):
                 calib_pitch_cos,
                 calib_pitch_sin,
             ) in enumerate(self.train_loader):
+                # i += 1
+                # if i > 10:
+                #     break
                 inputs = inputs.cuda(self.local_rank, non_blocking=True)
                 calibs = calibs.cuda(self.local_rank, non_blocking=True)
                 for (
@@ -190,7 +206,7 @@ class Trainer(object):
                 for key in loss_terms.keys():
                     if key not in disp_dict.keys():
                         disp_dict[key] = 0
-                    disp_dict[key] += loss_terms[key]
+                    disp_dict[key] += loss_terms[key].detach()
                 progress_bar.update()
             progress_bar.close()
             for key in disp_dict.keys():
@@ -246,11 +262,11 @@ class Trainer(object):
             for key in loss_terms.keys():
                 if key not in stat_dict.keys():
                     stat_dict[key] = 0
-                stat_dict[key] += loss_terms[key]
+                stat_dict[key] += loss_terms[key].detach()
             for key in loss_terms.keys():
                 if key not in disp_dict.keys():
                     disp_dict[key] = 0
-                disp_dict[key] += loss_terms[key]
+                disp_dict[key] += loss_terms[key].detach()
             # display statistics in terminal
             if trained_batch % self.cfg_train["disp_frequency"] == 0:
                 log_str = "BATCH[%04d/%04d]" % (trained_batch, len(self.train_loader))

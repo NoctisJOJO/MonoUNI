@@ -3,7 +3,7 @@ random_seed: 414
 dataset:
   type: 'rope3d'
   root_dir: '/root/MonoUNI/dataset/Rope3d'
-  batch_size: 2
+  batch_size: 4
   class_merging: False
   use_dontcare: False
   use_3d_center: False
@@ -46,7 +46,7 @@ trainer:
   disp_frequency: 200 # display interval (in batch)
   log_dir: 'output/rope3d'
   out_dir: 'output/rope3d'
-  resume_model: '/root/MonoUNI/checkpoint/checkpoint_epoch_150.pth'  
+  #resume_model: '/root/MonoUNI/checkpoint/checkpoint_epoch_150.pth'  
 tester:
   threshold: 0.2  # confidence filter
   out_dir: 'output/rope3d_eval'
