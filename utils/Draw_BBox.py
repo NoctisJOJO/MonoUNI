@@ -1,3 +1,4 @@
+import json
 import os
 import cv2
 import numpy as np
@@ -12,6 +13,7 @@ import glob as gb
 import shutil
 from pyquaternion import Quaternion
 from tqdm import tqdm
+import yaml
 
 # stop python from writing so much bytecode
 sys.dont_write_bytecode = True
@@ -25,11 +27,14 @@ np.set_printoptions(suppress=True)
 # denorm_dir = ".\\datasets\\testing\\denorm_1"
 # save_dir = ".\\datasets\\testing\\visualize_original"
 img_dir = os.path.join("/root/MonoUNI/dataset/Rope3d/image_2")
-gt_label_dir = os.path.join("/root/MonoUNI/dataset/Rope3d/label_2_4cls_filter_with_roi_for_eval")
-det_label_dir=os.path.join("/root/MonoUNI/output/rope3d_eval/data_filter")
+Gtlabel_dir = os.path.join(
+    "/root/MonoUNI/dataset/Rope3d/label_2_4cls_filter_with_roi_for_eval"
+)
+Detlabel_dir = os.path.join("/root/MonoUNI/output/rope3d_eval/data_filter")
 calib_dir = os.path.join("/root/MonoUNI/dataset/Rope3d/calib")
+extrinsic = os.path.join("/root/MonoUNI/dataset/Rope3d/extrinsics")
 denorm_dir = os.path.join("/root/MonoUNI/dataset/Rope3d/denorm")
-save_dir = os.path.join("/root/MonoUNI/dataset/Rope3d/final_2")
+save_dir = os.path.join("/root/MonoUNI/dataset/Rope3d/finle")
 
 color_list = {
     "car": (0, 0, 255),
@@ -98,15 +103,6 @@ class Data:
         return "\n".join("%s: %s" % item for item in attrs.items())
 
 
-def progress(count, total, status=""):
-    bar_len = 60
-    filled_len = int(round(bar_len * count / float(total)))
-    percents = round(100.0 * count / float(total), 1)
-    bar = "=" * filled_len + ">" + "-" * (bar_len - filled_len)
-    sys.stdout.write("[%s] %s%s ...%s\r" % (bar, percents, "%", status))
-    sys.stdout.flush()
-
-
 # 从label文件中加载检测内容
 def load_detect_data(filename):
     data = []
@@ -159,7 +155,34 @@ def load_denorm_data(denormfile):
     return np.array(de_norm)
 
 
-# 计算相机坐标系到地面的转化
+# V2X-Seq 标签文件中的三维目标框信息(pos,dim,ry)在虚拟LiDAR坐标系下，所以需要转至相机坐标系
+def transfer_Lidar2Camera(Lidar_pos, R, T, ry):
+    """Args:
+        Lidar_pos: 虚拟LiDAR坐标系下的物体位置
+        R: 虚拟LiDAR坐标系到相机坐标系的旋转矩阵
+        T: 虚拟LiDAR坐标系到相机坐标系的平移
+        ry3d(在V2X-Seq中输入ry在虚拟LiDAR坐标系下): 虚拟LiDAR坐标系下，物体绕Z轴旋转到x轴的角度；相机坐标系下物体绕y轴旋转到x轴的角度
+
+    Returns:
+        camera_pos: 相机坐标系下的物体位置
+        rot_camera_res: 相机坐标系下的物体角度（绕y轴旋转至x轴）
+    """
+    Lidar_pos = np.array(Lidar_pos).T
+    R = np.array(R)
+    T = np.array(T).flatten()
+    ###   camera_pos = Lidar_pos.dot(R) + T  注意点积顺序，这里是 (3,1) * (3，3)，计算错误
+    # camera_pos = R.dot(Lidar_pos) + T       同下，为正确计算
+    camera_pos = R @ Lidar_pos + T
+
+    theta_Lidar = np.matrix(data=[math.cos(ry), math.sin(ry), 0]).reshape(3, 1)
+    theta_Camera = R @ theta_Lidar
+    # 因为在相机坐标系下是绕y旋转，所以 x-z 平面, 函数输入的y是z轴的向量
+    rot_camera_res = math.atan2(theta_Camera[2], theta_Camera[0])
+
+    return camera_pos, rot_camera_res
+
+
+# 相机坐标系到地面坐标系的转换 获得地面坐标系是为了获得8个角点的坐标
 def compute_c2g_trans(de_norm):
     ground_z_axis = de_norm
     cam_xaxis = np.array([1.0, 0.0, 0.0])
@@ -196,57 +219,73 @@ def read_kitti_cal(calfile):
     return p2
 
 
-# Projects a 3D box into 2D vertices using the camera2ground tranformation
-def project_3d_ground(p2, de_bottom_center, w3d, h3d, l3d, ry3d, de_norm, c2g_trans):
+# 从外参文件中获得旋转矩阵和平移矩阵
+# def load_transfer_data(extrifile):
+#     cfg = yaml.load(open(extrifile, "r"), Loader=yaml.Loader)
+#     R = cfg["transform"]["rotation"]
+#     t = cfg["transform"]["translation"]
+#     return R, t
+
+
+# 获得像素坐标系下的8个角点
+def project_3d_ground(p2, Object_center, w3d, h3d, l3d, ry3d, c2g_trans, isCenter=True):
     """
     Args:
-        p2 (nparray): projection matrix of size 4x3
-        de_bottom_center: bottom center XYZ-coord of the object
+        p2 (nparray): 相机内参矩阵 不带畸变（3*3），带畸变（3*4），试了带畸变的有问题
+        Object_center: 标签文件中物体的三维坐标点(x,y,z)，可能是底部中心，可能是正中心，取决于数据集
         w3d: width of object
         h3d: height of object
         l3d: length of object
-        ry3d: rotation w.r.t y-axis
-        de_norm: [a,b,c] denotes the ground equation plane
+        ry3d: 虚拟LiDAR坐标系下，物体绕Z轴旋转到x轴的角度；相机坐标系下物体绕y轴旋转到x轴的角度
         c2g_trans: camera_to_ground translation
+    Return:
+        verts2d: 8个角点在像素坐标系的坐标
+        verts3d: 8个角点在相机坐标系的坐标
     """
-    de_bottom_center_in_ground = c2g_trans.dot(
-        de_bottom_center
-    )  # convert de_bottom_center in Camera coord into Ground coord
-    bottom_center_ground = np.array(de_bottom_center_in_ground)
-    bottom_center_ground = bottom_center_ground.reshape((3, 1))
-    theta = np.matrix([math.cos(ry3d), 0, -math.sin(ry3d)]).reshape(3, 1)
-    theta0 = c2g_trans[:3, :3] * theta  # first column
+    Object_center_Ground = c2g_trans.dot(
+        Object_center
+    )  # 将相机坐标系中的物体坐标转换为地面坐标系
+    Object_center_Ground = np.array(Object_center_Ground)
+    Object_center_Ground = Object_center_Ground.reshape((3, 1))
+
+    # 将相机坐标系中的物体航向角转换为地面坐标系
+    theta0 = np.matrix(data=[math.cos(ry3d), 0, -math.sin(ry3d)]).reshape(3, 1)
+    theta0 = c2g_trans[:3, :3] @ theta0
     yaw_world_res = math.atan2(theta0[1], theta0[0])
+
     g2c_trans = np.linalg.inv(c2g_trans)
-    verts2d = get_camera_3d_8points_g2c(
+    verts2d, verts3d = get_camera_3d_8points_g2c(
         w3d,
         h3d,
         l3d,
         yaw_world_res,
-        bottom_center_ground,
+        Object_center_Ground,
         g2c_trans,
         p2,
-        isCenter=False,
+        isCenter,
     )
     verts2d = np.array(verts2d)
-    return verts2d
+    verts3d = np.array(verts3d)
+    return verts2d, verts3d
 
 
 def get_camera_3d_8points_g2c(
-    w3d, h3d, l3d, yaw_ground, center_ground, g2c_trans, p2, isCenter=True
+    w3d, h3d, l3d, yaw_ground, center_ground, g2c_trans, p2, isCenter
 ):
     """
-    function: projection 3D to 2D
-    w3d: width of object
-    h3d: height of object
-    l3d: length of object
-    yaw_world: yaw angle in world coordinate
-    center_world: the center or the bottom-center of the object in world-coord
-    g2c_trans: ground2camera / world2camera transformation
-    p2: projection matrix of size 4x3 (camera intrinsics)
-    isCenter:
-        1: center,
-        0: bottom
+    Args:
+        w3d: width of object
+        h3d: height of object
+        l3d: length of object
+        yaw_ground: yaw angle in world coordinate
+        center_ground: the center or the bottom-center of the object in world-coord
+        g2c_trans: ground2camera / world2camera transformation
+        p2: projection matrix of size 4x3 (camera intrinsics)
+        isCenter: 标签文件中物体的三维坐标
+            1: 物体的正中心,
+            0: 物体的底部中心
+    Returns:
+        _corners_2d_: 像素坐标系下物体的8个角点
     """
     ground_r = np.matrix(
         [
@@ -254,8 +293,7 @@ def get_camera_3d_8points_g2c(
             [math.sin(yaw_ground), math.cos(yaw_ground), 0],
             [0, 0, 1],
         ]
-    )
-    # l, w, h = obj_size
+    )  # 地面坐标系下物体的旋转矩阵
     w = w3d
     l = l3d
     h = h3d
@@ -279,131 +317,124 @@ def get_camera_3d_8points_g2c(
 
     corners_3d_ground = np.matrix(ground_r) * np.matrix(corners_3d_ground) + np.matrix(
         center_ground
-    )  # [3, 8]
+    )  # [3, 8] 地面坐标系下物体的8个角点坐标
     if g2c_trans.shape[0] == 4:  # world2camera transformation
         ones = np.ones(8).reshape(1, 8).tolist()
         corners_3d_cam = g2c_trans * np.matrix(corners_3d_ground.tolist() + ones)
         corners_3d_cam = corners_3d_cam[:3, :]
-    else:  # only consider the rotation
+    else:  # only consider the rotation 相机坐标系下物体的8个角点坐标
         corners_3d_cam = np.matrix(g2c_trans) * corners_3d_ground  # [3, 8]
 
     pt = p2[:3, :3] * corners_3d_cam
     corners_2d = pt / pt[2]
-    corners_2d_all = corners_2d.reshape(-1)
-    if True in np.isnan(corners_2d_all):
-        print("Invalid projection")
-        return None
+    corners_2d_all = corners_2d.reshape(-1)  # 像素坐标系下物体的8个角点坐标
+    # if True in np.isnan(corners_2d_all):
+    #     print("Invalid projection")
+    #     return None, corners_2d_all
 
-    corners_2d = corners_2d[0:2].T.tolist()
+    corners_2d = corners_2d[0:2].T.tolist()  # (8,2)
+    corners_3d_cam = corners_3d_cam.T  # (8,3)
     for i in range(8):
         corners_2d[i][0] = int(corners_2d[i][0])
         corners_2d[i][1] = int(corners_2d[i][1])
-    return corners_2d
+    return corners_2d, corners_3d_cam
 
 
 # 显示2D和3D框
 def show_box_with_roll(name_list, thresh=0.5):
-    for name in tqdm(name_list):
+    for name in tqdm(name_list, desc="Draw BBox"):
         name = name.strip()
         name = name.split("/")
         name = name[-1].split(".")[0]
         img_path = os.path.join(img_dir, "%s.jpg" % (name))
-        gt_result = load_detect_data(os.path.join(gt_label_dir, "%s.txt" % (name)))
-        det_result=load_detect_data(os.path.join(det_label_dir, "%s.txt" % (name)))
+        groundtruth_file = os.path.join(Gtlabel_dir, f"{name}.txt")
+        detect_file = os.path.join(Detlabel_dir, "%s.txt" % (name))
+        gtresult = load_detect_data(groundtruth_file)
+        detresult = load_detect_data(detect_file)
         denorm_file = os.path.join(denorm_dir, "%s.txt" % (name))
         de_norm = load_denorm_data(denorm_file)  # [ax+by+cz+d=0]
         c2g_trans = compute_c2g_trans(de_norm)
 
         calfile = os.path.join(calib_dir, "%s.txt" % (name))
         p2 = read_kitti_cal(calfile)
+        # extrifile = os.path.join(extrinsic, "%s.yaml" % (name))
+        # R, T = load_transfer_data(extrifile)
 
         img = cv2.imread(img_path)
         h, w, c = img.shape
-        
+
         # 真值
-        for result_index in range(len(gt_result)):
-            t = gt_result[result_index]
-            # if t.score < thresh:
+        for result_index in range(len(gtresult)):
+            gt = gtresult[result_index]
+            # if gt.score < thresh:
             #     continue
-            # if t.obj_type not in color_list.keys():
+            # if gt.obj_type not in color_list.keys():
             #     continue
-            # color_type = color_list[t.obj_type]
-            cv2.rectangle(
-                img, (t.x1, t.y1), (t.x2, t.y2), (255, 255, 255), 1
-            )  # 2D标注框
-            if t.w <= 0.05 and t.l <= 0.05 and t.h <= 0.05:  # 无效的annos
+            # color_type = color_list[gt.obj_type]
+            cv2.rectangle(img, (gt.x1, gt.y1), (gt.x2, gt.y2), (255, 255, 255), 1)
+            if gt.w <= 0.05 and gt.l <= 0.05 and gt.h <= 0.05:  # 无效的annos
                 continue
-            cam_bottom_center = [t.X, t.Y, t.Z]  # 相机坐标系的底面中心
-            verts2d = project_3d_ground(
+            # obj_center,gt.yaw = transfer_Lidar2Camera([gt.X, gt.Y, gt.Z], R, T,gt.yaw)
+            gtverts2d, gtverts3d = project_3d_ground(
                 p2,
-                np.array(cam_bottom_center),
-                t.w,
-                t.h,
-                t.l,
-                t.yaw,
-                de_norm,
+                np.array([gt.X, gt.Y, gt.Z]),
+                gt.w,
+                gt.h,
+                gt.l,
+                gt.yaw,
                 c2g_trans,
+                False,
             )
-            verts2d = verts2d.astype(np.int32)
-
+            # if gtverts2d is None:
+            #     continue
+            # verts3d = verts3d.astype(np.int32)
             # draw projection
-            cv2.line(img, tuple(verts2d[2]), tuple(verts2d[1]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[1]), tuple(verts2d[0]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[0]), tuple(verts2d[3]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[2]), tuple(verts2d[3]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[7]), tuple(verts2d[4]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[4]), tuple(verts2d[5]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[5]), tuple(verts2d[6]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[6]), tuple(verts2d[7]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[7]), tuple(verts2d[3]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[1]), tuple(verts2d[5]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[0]), tuple(verts2d[4]), (0,0,255), 2)
-            cv2.line(img, tuple(verts2d[2]), tuple(verts2d[6]), (0,0,255), 2)
-         
-        # 检测值   
-        for result_index in range(len(det_result)):
-            t = det_result[result_index]
-            # if t.score < thresh:
-            #     continue
-            # if t.obj_type not in color_list.keys():
-            #     continue
-            # color_type = color_list[t.obj_type]
-            cv2.rectangle(
-                img, (t.x1, t.y1), (t.x2, t.y2), (255, 255, 255), 1
-            )  # 2D标注框
-            if t.w <= 0.05 and t.l <= 0.05 and t.h <= 0.05:  # 无效的annos
-                continue
-            cam_bottom_center = [t.X, t.Y, t.Z]  # 相机坐标系的底面中心
-            verts2d = project_3d_ground(
+            cv2.line(img, tuple(gtverts2d[2]), tuple(gtverts2d[1]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[1]), tuple(gtverts2d[0]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[0]), tuple(gtverts2d[3]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[2]), tuple(gtverts2d[3]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[7]), tuple(gtverts2d[4]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[4]), tuple(gtverts2d[5]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[5]), tuple(gtverts2d[6]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[6]), tuple(gtverts2d[7]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[7]), tuple(gtverts2d[3]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[1]), tuple(gtverts2d[5]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[0]), tuple(gtverts2d[4]), (0, 0, 255), 2)
+            cv2.line(img, tuple(gtverts2d[2]), tuple(gtverts2d[6]), (0, 0, 255), 2)
+        # 检测值
+        for result_index in range(len(detresult)):
+            det = detresult[result_index]
+            cv2.rectangle(img, (det.x1, det.y1), (det.x2, det.y2), (0, 0, 0), 1)
+            detverts2d, detverts3d = project_3d_ground(
                 p2,
-                np.array(cam_bottom_center),
-                t.w,
-                t.h,
-                t.l,
-                t.yaw,
-                de_norm,
+                np.array([det.X, det.Y, det.Z]),
+                det.w,
+                det.h,
+                det.l,
+                det.yaw,
                 c2g_trans,
+                False,
             )
-            verts2d = verts2d.astype(np.int32)
-
-            # draw projection
-            cv2.line(img, tuple(verts2d[2]), tuple(verts2d[1]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[1]), tuple(verts2d[0]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[0]), tuple(verts2d[3]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[2]), tuple(verts2d[3]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[7]), tuple(verts2d[4]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[4]), tuple(verts2d[5]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[5]), tuple(verts2d[6]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[6]), tuple(verts2d[7]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[7]), tuple(verts2d[3]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[1]), tuple(verts2d[5]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[0]), tuple(verts2d[4]), (0,255,0), 2)
-            cv2.line(img, tuple(verts2d[2]), tuple(verts2d[6]), (0,255,0), 2)
+            # if detverts2d is None:
+            #     continue
+            cv2.line(img, tuple(detverts2d[2]), tuple(detverts2d[1]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[1]), tuple(detverts2d[0]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[0]), tuple(detverts2d[3]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[2]), tuple(detverts2d[3]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[7]), tuple(detverts2d[4]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[4]), tuple(detverts2d[5]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[5]), tuple(detverts2d[6]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[6]), tuple(detverts2d[7]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[7]), tuple(detverts2d[3]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[1]), tuple(detverts2d[5]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[0]), tuple(detverts2d[4]), (0, 255, 0), 2)
+            cv2.line(img, tuple(detverts2d[2]), tuple(detverts2d[6]), (0, 255, 0), 2)
         cv2.imwrite("%s/%s.jpg" % (save_dir, name), img)
 
 
 if __name__ == "__main__":
-    name_list=os.listdir(det_label_dir)
+    name_list = os.listdir(Detlabel_dir)
+    # print(name_list)
     if os.path.exists(save_dir):
         os.system(f"rm -r {save_dir}")
     os.mkdir(save_dir)
